@@ -175,7 +175,10 @@ class MovementRecorder(object):
 
     def replay_reverse(self):
         """
-        Replay history in reverse by applying inverse movement commands.
+        Turn around, then replay history in reverse.
+
+        Turning around first lets reverse traversal use forward translation,
+        so the robot does not spend the whole replay driving backward.
         """
         self._finish_active()
         if not self._history:
@@ -185,11 +188,17 @@ class MovementRecorder(object):
         print("[history] reversing %d recorded steps..." % len(self._history))
         self._is_replaying = True
         try:
+            # Face back along the route before replaying reverse actions.
+            rollereye.set_rotationSpeed(TURN_SPEED_DPS)
+            rollereye.set_rotate_3(direction=2, degree=180)
+            time.sleep(SETTLE_S)
+
             for step in reversed(self._history):
                 if step["kind"] == "translate":
-                    inverse_degree = 180 if step["degree"] == 0 else 0
+                    # Because we already turned 180, replaying translate with
+                    # the same local direction retraces the path forward.
                     rollereye.set_translationSpeed(step["speed_mps"])
-                    rollereye.set_translate(degree=inverse_degree)
+                    rollereye.set_translate(degree=step["degree"])
                     time.sleep(step["duration_s"])
                     rollereye.stop_move()
                     time.sleep(SETTLE_S)
@@ -320,9 +329,10 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
     """
     Scan only the forward sector and choose the best heading.
 
-    We sample center (0 deg), then check right-side offsets up to
-    MAX_FORWARD_TURN_DEG, return to center, then check left-side offsets up to
-    MAX_FORWARD_TURN_DEG, and finally return to center heading.
+    We sample center (0 deg), then scan the full forward arc in one pass:
+      1) step right to +MAX_FORWARD_TURN_DEG
+      2) sweep left across center to -MAX_FORWARD_TURN_DEG
+      3) return to center once
 
     Returns:
       best_offset_right_deg: heading offset (from original), turning right.
@@ -330,7 +340,7 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
       override_mode: possibly-updated mode if user toggled during scan.
       interrupted: True when a user key command should abort autonomous scan.
     """
-    scan_offsets = list(range(SCAN_STEP_DEG, MAX_FORWARD_TURN_DEG + 1, SCAN_STEP_DEG))
+    side_steps = list(range(SCAN_STEP_DEG, MAX_FORWARD_TURN_DEG + 1, SCAN_STEP_DEG))
 
     # Measure current heading first (offset = 0).
     best_distance, override_mode, interrupted = wait_for_fresh_tof(
@@ -345,8 +355,12 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
         best_distance = 0.0
     best_offset_right_deg = 0
 
-    # Scan to the right side (0 -> +MAX_FORWARD_TURN_DEG).
-    for offset in scan_offsets:
+    # Track sampled offsets so we do not score the same heading twice
+    # while sweeping across center.
+    sampled_offsets = set([0])
+
+    # Step right to +MAX_FORWARD_TURN_DEG.
+    for offset in side_steps:
         key = keyboard.read_key()
         if key is not None:
             override_mode, _, should_interrupt = process_key_command(
@@ -375,21 +389,8 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
             best_distance = d
             best_offset_right_deg = offset
 
-    # Return from right-most offset back to center.
-    for _ in scan_offsets:
-        key = keyboard.read_key()
-        if key is not None:
-            override_mode, _, should_interrupt = process_key_command(
-                key=key, recorder=recorder, override_mode=override_mode
-            )
-            if should_interrupt:
-                return best_offset_right_deg, best_distance, override_mode, True
-        rotate_deg(
-            recorder=recorder, direction=1, degrees=SCAN_STEP_DEG, record=False
-        )
-
-    # Scan to the left side (0 -> -MAX_FORWARD_TURN_DEG).
-    for step_count, _ in enumerate(scan_offsets, start=1):
+    # Sweep left from +MAX_FORWARD_TURN_DEG to -MAX_FORWARD_TURN_DEG.
+    for step_count in range(1, (len(side_steps) * 2) + 1):
         key = keyboard.read_key()
         if key is not None:
             override_mode, _, should_interrupt = process_key_command(
@@ -411,15 +412,16 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
         if d is None:
             d = 0.0
 
-        # Convert left offsets into right-turn representation:
-        # left 30 => right 330, left 60 => right 300, etc.
-        offset_right = (360 - step_count * SCAN_STEP_DEG) % 360
-        if d > best_distance:
+        # Current right-offset while sweeping left from +MAX to -MAX.
+        raw_offset = MAX_FORWARD_TURN_DEG - step_count * SCAN_STEP_DEG
+        offset_right = raw_offset % 360
+        if (offset_right not in sampled_offsets) and (d > best_distance):
             best_distance = d
             best_offset_right_deg = offset_right
+        sampled_offsets.add(offset_right)
 
     # Return from left-most offset back to center.
-    for _ in scan_offsets:
+    for _ in side_steps:
         key = keyboard.read_key()
         if key is not None:
             override_mode, _, should_interrupt = process_key_command(
