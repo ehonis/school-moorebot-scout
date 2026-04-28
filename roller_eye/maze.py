@@ -41,8 +41,9 @@ FORWARD_SPEED_MPS = 0.16
 # Rotation speed used for scan turns (deg/s).
 TURN_SPEED_DPS = 90
 
-# Scan resolution. Smaller step = better heading search, slower scan.
-SCAN_STEP_DEG = 30
+# Scan resolution. Larger step = faster scan with less angular precision.
+# Must evenly divide 360. 45 gives 8 samples per sweep (was 12 at 30 deg).
+SCAN_STEP_DEG = 45
 
 # Do not pick headings in the rear half of the robot.
 # This keeps recovery turns from backtracking toward already-traveled space.
@@ -56,7 +57,8 @@ MAX_FORWARD_TURN_DEG = 90
 TOF_STALE_TIMEOUT_S = 1.0
 
 # Timeout to wait for one fresh TOF reading after each turn.
-TOF_WAIT_TIMEOUT_S = 0.5
+# Shorter value = faster sweep; 0.25 s is enough for the 10 Hz TOF node.
+TOF_WAIT_TIMEOUT_S = 0.25
 
 # Tiny settle wait to let motion/reading stabilize between operations.
 SETTLE_S = 0.15
@@ -327,21 +329,33 @@ def rotate_deg(recorder, direction, degrees, record=True):
 
 def choose_best_heading_with_scan(recorder, keyboard, override_mode):
     """
-    Scan full 360 degrees and choose the best heading.
+    Sweep 360 degrees right, sample clearance at each step, and leave the
+    robot already facing the best (most open) heading.
 
-    We sample center (0 deg), then rotate right one step at a time through
-    all remaining headings, and finish by returning to center heading.
+    Key differences from the old approach:
+    - The robot stops AT the chosen heading instead of returning to 0 and then
+      doing a second turn. Returning to 0 was the root cause of the infinite-
+      circle bug: if the scan kept picking the same relative offset the robot
+      would turn that same amount every cycle and orbit forever.
+    - is_offset_in_forward_sector() is now applied so we prefer headings in the
+      front 180-degree arc. Rear headings are only used as a last resort when
+      everything forward is blocked.
+    - Two-pass selection: first try forward sector only; fall back to all
+      headings when the forward sector has no clearance.
 
     Returns:
-      best_offset_right_deg: heading offset (from original), turning right.
-      best_distance_m: measured clearance at that heading.
-      override_mode: possibly-updated mode if user toggled during scan.
-      interrupted: True when a user key command should abort autonomous scan.
+      (0, best_distance_m, override_mode, interrupted)
+      The returned offset is always 0 because the robot is already pointed at
+      the best heading, so turn_to_best_heading() becomes a no-op.
     """
+    # Total number of angular samples (e.g. 360 / 45 = 8).
     steps = int(360 / SCAN_STEP_DEG)
 
-    # Measure current heading first (offset = 0).
-    best_distance, override_mode, interrupted = wait_for_fresh_tof(
+    # distances[i] = clearance measured at (i * SCAN_STEP_DEG) degrees right of start.
+    distances = []
+
+    # --- Sample the current (blocked) heading first (step 0, offset 0). ---
+    d, override_mode, interrupted = wait_for_fresh_tof(
         TOF_WAIT_TIMEOUT_S,
         keyboard=keyboard,
         recorder=recorder,
@@ -349,25 +363,24 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
     )
     if interrupted:
         return 0, 0.0, override_mode, True
-    if best_distance is None:
-        best_distance = 0.0
-    best_offset_right_deg = 0
+    distances.append(d if d is not None else 0.0)
 
-    # Step through all other headings to the right.
+    # --- Sweep right one step at a time and record each clearance reading. ---
     for step_idx in range(1, steps):
+        # Poll keyboard so user can interrupt or switch modes mid-scan.
         key = keyboard.read_key()
         if key is not None:
             override_mode, _, should_interrupt = process_key_command(
                 key=key, recorder=recorder, override_mode=override_mode
             )
             if should_interrupt:
-                return best_offset_right_deg, best_distance, override_mode, True
+                # Robot may be mid-sweep. Return offset 0 so the caller does
+                # not try to turn further on top of an unknown heading.
+                return 0, max(distances) if distances else 0.0, override_mode, True
 
-        # Scan spins are sensing-only actions and should not be added to
-        # backtrack history; h should replay travel, not replay a scan.
-        rotate_deg(
-            recorder=recorder, direction=2, degrees=SCAN_STEP_DEG, record=False
-        )
+        # Scan rotations are sensing-only; don't add them to backtrack history.
+        rotate_deg(recorder=recorder, direction=2, degrees=SCAN_STEP_DEG, record=False)
+
         d, override_mode, interrupted = wait_for_fresh_tof(
             TOF_WAIT_TIMEOUT_S,
             keyboard=keyboard,
@@ -375,19 +388,63 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
             override_mode=override_mode,
         )
         if interrupted:
-            return best_offset_right_deg, best_distance, override_mode, True
-        if d is None:
-            d = 0.0
+            return 0, max(distances) if distances else 0.0, override_mode, True
+        distances.append(d if d is not None else 0.0)
 
-        offset = step_idx * SCAN_STEP_DEG
-        if d > best_distance:
-            best_distance = d
-            best_offset_right_deg = offset
+    # After the loop the robot has rotated (steps - 1) * SCAN_STEP_DEG degrees
+    # to the right and is sitting one step short of a full 360.
 
-    # Final step returns robot to center heading.
-    rotate_deg(recorder=recorder, direction=2, degrees=SCAN_STEP_DEG, record=False)
+    # --- Find the best heading (two-pass: forward sector preferred). ---
+    best_step = None
+    best_dist = -1.0
+    # Pass 1: only consider headings in the forward sector.
+    for i, dist in enumerate(distances):
+        if is_offset_in_forward_sector(i * SCAN_STEP_DEG) and dist > best_dist:
+            best_dist = dist
+            best_step = i
+    # Pass 2: if nothing forward was clear enough, take the best overall heading.
+    if best_step is None:
+        best_step = max(range(len(distances)), key=lambda i: distances[i])
+        best_dist = distances[best_step]
 
-    return best_offset_right_deg, best_distance, override_mode, False
+    print(
+        "[scan] best heading %d deg right, clearance %.2f m"
+        % (best_step * SCAN_STEP_DEG, best_dist)
+    )
+
+    # --- Turn from the current position directly to the best heading. ---
+    # Current position is at step index (steps - 1) from the original.
+    # We need to get to step index best_step. The shortest arc might be
+    # a small right turn or a small left turn.
+    current_step = steps - 1
+    # How many SCAN_STEP_DEG right-turns to reach best_step from current_step.
+    delta_right = (best_step - current_step) % steps
+    # Equivalent left-turn count.
+    delta_left = steps - delta_right
+
+    if delta_right == 0:
+        # Already facing the best heading — no turn needed.
+        pass
+    elif delta_right <= delta_left:
+        # Fewer steps turning right.
+        rotate_deg(
+            recorder=recorder,
+            direction=2,
+            degrees=delta_right * SCAN_STEP_DEG,
+            record=False,
+        )
+    else:
+        # Fewer steps turning left.
+        rotate_deg(
+            recorder=recorder,
+            direction=1,
+            degrees=delta_left * SCAN_STEP_DEG,
+            record=False,
+        )
+
+    # Robot is now facing the best heading.
+    # Return offset 0 so turn_to_best_heading() is a no-op.
+    return 0, best_dist, override_mode, False
 
 
 def is_offset_in_forward_sector(offset_right_deg):
@@ -631,7 +688,10 @@ def start():
                     moving_forward = False
                 time.sleep(SETTLE_S)
 
-                best_offset, _, override_mode, interrupted = (
+                # best_offset is always 0 from the new scan function because
+                # the robot stops at the chosen heading during the sweep itself.
+                # best_dist tells us whether that heading is actually clear.
+                best_offset, best_dist, override_mode, interrupted = (
                     choose_best_heading_with_scan(
                         recorder=recorder,
                         keyboard=keyboard,
@@ -642,6 +702,9 @@ def start():
                     moving_forward = False
                     time.sleep(0.05)
                     continue
+
+                # turn_to_best_heading is effectively a no-op here (offset == 0)
+                # but we keep the call so the code path stays consistent.
                 override_mode, interrupted = turn_to_best_heading(
                     recorder=recorder,
                     keyboard=keyboard,
@@ -652,6 +715,13 @@ def start():
                     moving_forward = False
                     time.sleep(0.05)
                     continue
+
+                # If every heading was blocked (e.g. dead end), backtrack along
+                # the recorded path instead of driving straight into a wall again.
+                if best_dist <= STOP_DISTANCE_M:
+                    print("[auto] all paths blocked — backtracking")
+                    recorder.replay_reverse()
+                    time.sleep(SETTLE_S)
 
                 # Resume continuous forward movement from the new heading.
                 recorder.start_translate(degree=0, speed_mps=FORWARD_SPEED_MPS)
