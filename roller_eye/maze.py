@@ -327,12 +327,10 @@ def rotate_deg(recorder, direction, degrees, record=True):
 
 def choose_best_heading_with_scan(recorder, keyboard, override_mode):
     """
-    Scan only the forward sector and choose the best heading.
+    Scan full 360 degrees and choose the best heading.
 
-    We sample center (0 deg), then scan the full forward arc in one pass:
-      1) step right to +MAX_FORWARD_TURN_DEG
-      2) sweep left across center to -MAX_FORWARD_TURN_DEG
-      3) return to center once
+    We sample center (0 deg), then rotate right one step at a time through
+    all remaining headings, and finish by returning to center heading.
 
     Returns:
       best_offset_right_deg: heading offset (from original), turning right.
@@ -340,7 +338,7 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
       override_mode: possibly-updated mode if user toggled during scan.
       interrupted: True when a user key command should abort autonomous scan.
     """
-    side_steps = list(range(SCAN_STEP_DEG, MAX_FORWARD_TURN_DEG + 1, SCAN_STEP_DEG))
+    steps = int(360 / SCAN_STEP_DEG)
 
     # Measure current heading first (offset = 0).
     best_distance, override_mode, interrupted = wait_for_fresh_tof(
@@ -355,12 +353,8 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
         best_distance = 0.0
     best_offset_right_deg = 0
 
-    # Track sampled offsets so we do not score the same heading twice
-    # while sweeping across center.
-    sampled_offsets = set([0])
-
-    # Step right to +MAX_FORWARD_TURN_DEG.
-    for offset in side_steps:
+    # Step through all other headings to the right.
+    for step_idx in range(1, steps):
         key = keyboard.read_key()
         if key is not None:
             override_mode, _, should_interrupt = process_key_command(
@@ -385,53 +379,13 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
         if d is None:
             d = 0.0
 
+        offset = step_idx * SCAN_STEP_DEG
         if d > best_distance:
             best_distance = d
             best_offset_right_deg = offset
 
-    # Sweep left from +MAX_FORWARD_TURN_DEG to -MAX_FORWARD_TURN_DEG.
-    for step_count in range(1, (len(side_steps) * 2) + 1):
-        key = keyboard.read_key()
-        if key is not None:
-            override_mode, _, should_interrupt = process_key_command(
-                key=key, recorder=recorder, override_mode=override_mode
-            )
-            if should_interrupt:
-                return best_offset_right_deg, best_distance, override_mode, True
-        rotate_deg(
-            recorder=recorder, direction=1, degrees=SCAN_STEP_DEG, record=False
-        )
-        d, override_mode, interrupted = wait_for_fresh_tof(
-            TOF_WAIT_TIMEOUT_S,
-            keyboard=keyboard,
-            recorder=recorder,
-            override_mode=override_mode,
-        )
-        if interrupted:
-            return best_offset_right_deg, best_distance, override_mode, True
-        if d is None:
-            d = 0.0
-
-        # Current right-offset while sweeping left from +MAX to -MAX.
-        raw_offset = MAX_FORWARD_TURN_DEG - step_count * SCAN_STEP_DEG
-        offset_right = raw_offset % 360
-        if (offset_right not in sampled_offsets) and (d > best_distance):
-            best_distance = d
-            best_offset_right_deg = offset_right
-        sampled_offsets.add(offset_right)
-
-    # Return from left-most offset back to center.
-    for _ in side_steps:
-        key = keyboard.read_key()
-        if key is not None:
-            override_mode, _, should_interrupt = process_key_command(
-                key=key, recorder=recorder, override_mode=override_mode
-            )
-            if should_interrupt:
-                return best_offset_right_deg, best_distance, override_mode, True
-        rotate_deg(
-            recorder=recorder, direction=2, degrees=SCAN_STEP_DEG, record=False
-        )
+    # Final step returns robot to center heading.
+    rotate_deg(recorder=recorder, direction=2, degrees=SCAN_STEP_DEG, record=False)
 
     return best_offset_right_deg, best_distance, override_mode, False
 
