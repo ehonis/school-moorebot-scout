@@ -45,6 +45,10 @@ TURN_SPEED_DPS = 90
 # Must evenly divide 360. 45 gives 8 samples per sweep (was 12 at 30 deg).
 SCAN_STEP_DEG = 45
 
+# Continuous spin speed for scan-only turns (deg/s).
+# Kept higher than regular turn speed so blocked recovery decisions are quick.
+SCAN_TURN_SPEED_DPS = 120
+
 # Do not pick headings in the rear half of the robot.
 # This keeps recovery turns from backtracking toward already-traveled space.
 # Interpretation:
@@ -329,19 +333,14 @@ def rotate_deg(recorder, direction, degrees, record=True):
 
 def choose_best_heading_with_scan(recorder, keyboard, override_mode):
     """
-    Sweep 360 degrees right, sample clearance at each step, and leave the
-    robot already facing the best (most open) heading.
+    Continuously spin right while sampling TOF at fixed angular intervals.
 
-    Key differences from the old approach:
-    - The robot stops AT the chosen heading instead of returning to 0 and then
-      doing a second turn. Returning to 0 was the root cause of the infinite-
-      circle bug: if the scan kept picking the same relative offset the robot
-      would turn that same amount every cycle and orbit forever.
-    - is_offset_in_forward_sector() is now applied so we prefer headings in the
-      front 180-degree arc. Rear headings are only used as a last resort when
-      everything forward is blocked.
-    - Two-pass selection: first try forward sector only; fall back to all
-      headings when the forward sector has no clearance.
+    Why this exists:
+    - The user requested "concurrent spin" scanning instead of stop-turn-stop.
+    - Continuous spin gives denser, more natural environmental sampling and
+      avoids the jerky stop/start behavior from discrete rotate_3 steps.
+    - We still preserve the anti-circle guard by selecting a heading once per
+      scan, then orienting to it in one final deterministic turn.
 
     Returns:
       (0, best_distance_m, override_mode, interrupted)
@@ -350,49 +349,57 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
     """
     # Total number of angular samples (e.g. 360 / 45 = 8).
     steps = int(360 / SCAN_STEP_DEG)
+    # Time between samples while continuously spinning.
+    sample_period_s = float(SCAN_STEP_DEG) / float(SCAN_TURN_SPEED_DPS)
 
-    # distances[i] = clearance measured at (i * SCAN_STEP_DEG) degrees right of start.
+    # distances[i] = clearance measured at (i * SCAN_STEP_DEG) degrees right
+    # of the heading where this scan started.
     distances = []
 
-    # --- Sample the current (blocked) heading first (step 0, offset 0). ---
-    d, override_mode, interrupted = wait_for_fresh_tof(
-        TOF_WAIT_TIMEOUT_S,
-        keyboard=keyboard,
-        recorder=recorder,
-        override_mode=override_mode,
-    )
+    # Start an in-place continuous right spin for sensing.
+    # We call SDK primitives directly (not recorder) so this scan motion is
+    # intentionally excluded from path-history replay.
+    rollereye.set_rotationSpeed(SCAN_TURN_SPEED_DPS)
+    rollereye.set_rotate(direction=2)
+
+    # Sample immediately at t=0 for offset 0, then every sample_period_s.
+    next_sample_time_s = time.time()
+    interrupted = False
+    try:
+        while len(distances) < steps:
+            # Allow immediate user intervention even mid-spin.
+            key = keyboard.read_key()
+            if key is not None:
+                override_mode, _, should_interrupt = process_key_command(
+                    key=key, recorder=recorder, override_mode=override_mode
+                )
+                if should_interrupt:
+                    interrupted = True
+                    break
+
+            now_s = time.time()
+            if now_s >= next_sample_time_s:
+                # Use fresh TOF when available, otherwise treat as blocked.
+                # This is conservative and prevents selecting stale "open" data.
+                range_m, ts = get_tof_snapshot()
+                if range_m is not None and (now_s - ts) <= TOF_STALE_TIMEOUT_S:
+                    d = range_m
+                else:
+                    d = 0.0
+                distances.append(d)
+                next_sample_time_s += sample_period_s
+
+            time.sleep(0.01)
+    finally:
+        # Stop the scan spin before committing to the selected heading.
+        rollereye.stop_move()
+        time.sleep(SETTLE_S)
+
     if interrupted:
-        return 0, 0.0, override_mode, True
-    distances.append(d if d is not None else 0.0)
+        return 0, max(distances) if distances else 0.0, override_mode, True
 
-    # --- Sweep right one step at a time and record each clearance reading. ---
-    for step_idx in range(1, steps):
-        # Poll keyboard so user can interrupt or switch modes mid-scan.
-        key = keyboard.read_key()
-        if key is not None:
-            override_mode, _, should_interrupt = process_key_command(
-                key=key, recorder=recorder, override_mode=override_mode
-            )
-            if should_interrupt:
-                # Robot may be mid-sweep. Return offset 0 so the caller does
-                # not try to turn further on top of an unknown heading.
-                return 0, max(distances) if distances else 0.0, override_mode, True
-
-        # Scan rotations are sensing-only; don't add them to backtrack history.
-        rotate_deg(recorder=recorder, direction=2, degrees=SCAN_STEP_DEG, record=False)
-
-        d, override_mode, interrupted = wait_for_fresh_tof(
-            TOF_WAIT_TIMEOUT_S,
-            keyboard=keyboard,
-            recorder=recorder,
-            override_mode=override_mode,
-        )
-        if interrupted:
-            return 0, max(distances) if distances else 0.0, override_mode, True
-        distances.append(d if d is not None else 0.0)
-
-    # After the loop the robot has rotated (steps - 1) * SCAN_STEP_DEG degrees
-    # to the right and is sitting one step short of a full 360.
+    # After the loop the robot has rotated approximately
+    # (steps - 1) * SCAN_STEP_DEG degrees to the right.
 
     # --- Find the best heading (two-pass: forward sector preferred). ---
     best_step = None
