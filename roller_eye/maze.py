@@ -41,8 +41,8 @@ FORWARD_SPEED_MPS = 0.16
 # Rotation speed used for scan turns (deg/s).
 TURN_SPEED_DPS = 90
 
-# Scan resolution. Smaller step = better heading search, slower scan.
-SCAN_STEP_DEG = 30
+# Scan resolution. Increased to 60deg to make scan roughly 2x faster.
+SCAN_STEP_DEG = 60
 
 # Do not pick headings in the rear half of the robot.
 # This keeps recovery turns from backtracking toward already-traveled space.
@@ -56,14 +56,11 @@ MAX_FORWARD_TURN_DEG = 90
 TOF_STALE_TIMEOUT_S = 1.0
 
 # Timeout to wait for one fresh TOF reading after each turn.
-TOF_WAIT_TIMEOUT_S = 0.5
+# Halved to speed up scan responsiveness.
+TOF_WAIT_TIMEOUT_S = 0.25
 
 # Tiny settle wait to let motion/reading stabilize between operations.
 SETTLE_S = 0.15
-
-# Periodic TOF telemetry logging interval (seconds).
-# Lower this if you want denser logs.
-TOF_LOG_INTERVAL_S = 0.25
 
 # Manual override speed values (kept modest for tight spaces).
 MANUAL_FORWARD_SPEED_MPS = 0.16
@@ -149,14 +146,14 @@ class MovementRecorder(object):
             "start_s": time.time(),
         }
 
-    def rotate_degrees(self, direction, degrees, speed_dps):
+    def rotate_degrees(self, direction, degrees, speed_dps, record=True):
         """
         Execute an exact-degree turn and record it as a discrete event.
         """
         rollereye.set_rotationSpeed(speed_dps)
         rollereye.set_rotate_3(direction=direction, degree=degrees)
         time.sleep(SETTLE_S)
-        if self._is_replaying:
+        if self._is_replaying or (not record):
             return
         self._finish_active()
         self._history.append(
@@ -304,7 +301,7 @@ def wait_for_fresh_tof(max_wait_s, keyboard=None, recorder=None, override_mode=F
     return None, override_mode, False
 
 
-def rotate_deg(recorder, direction, degrees):
+def rotate_deg(recorder, direction, degrees, record=True):
     """
     Rotate by exact degrees using Scout API.
 
@@ -312,7 +309,12 @@ def rotate_deg(recorder, direction, degrees):
       1 = left (counter-clockwise)
       2 = right (clockwise)
     """
-    recorder.rotate_degrees(direction=direction, degrees=degrees, speed_dps=TURN_SPEED_DPS)
+    recorder.rotate_degrees(
+        direction=direction,
+        degrees=degrees,
+        speed_dps=TURN_SPEED_DPS,
+        record=record,
+    )
 
 
 def choose_best_heading_with_scan(recorder, keyboard, override_mode):
@@ -355,7 +357,11 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
             if should_interrupt:
                 return best_offset_right_deg, best_distance, override_mode, True
 
-        rotate_deg(recorder=recorder, direction=2, degrees=SCAN_STEP_DEG)
+        # Scan spins are sensing-only actions and should not be added to
+        # backtrack history; h should replay travel, not replay a scan.
+        rotate_deg(
+            recorder=recorder, direction=2, degrees=SCAN_STEP_DEG, record=False
+        )
         d, override_mode, interrupted = wait_for_fresh_tof(
             TOF_WAIT_TIMEOUT_S,
             keyboard=keyboard,
@@ -373,7 +379,7 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
             best_offset_right_deg = offset
 
     # Final step to return to original heading (completes full 360 scan).
-    rotate_deg(recorder=recorder, direction=2, degrees=SCAN_STEP_DEG)
+    rotate_deg(recorder=recorder, direction=2, degrees=SCAN_STEP_DEG, record=False)
 
     return best_offset_right_deg, best_distance, override_mode, False
 
@@ -509,31 +515,6 @@ def process_key_command(key, recorder, override_mode):
     return override_mode, False, False
 
 
-def log_tof_reading(range_m, timestamp_s, override_mode):
-    """
-    Print a compact TOF telemetry line for debugging.
-
-    Output fields:
-      mode   : AUTO or OVERRIDE
-      tof_m  : latest TOF distance in meters
-      age_s  : age of that reading in seconds
-      state  : FRESH / STALE / NONE
-    """
-    now = time.time()
-    mode_label = "OVERRIDE" if override_mode else "AUTO"
-
-    if range_m is None:
-        print("[TOF][%s] tof_m=NONE age_s=NONE state=NONE" % mode_label)
-        return
-
-    age_s = now - timestamp_s
-    freshness = "FRESH" if age_s <= TOF_STALE_TIMEOUT_S else "STALE"
-    print(
-        "[TOF][%s] tof_m=%.3f age_s=%.3f state=%s"
-        % (mode_label, range_m, age_s, freshness)
-    )
-
-
 def request_go_home():
     """
     Ask NavPath to return to home/dock.
@@ -604,7 +585,6 @@ def start():
     recorder.start_translate(degree=0, speed_mps=FORWARD_SPEED_MPS)
     moving_forward = True
     override_mode = False
-    last_tof_log_s = 0.0
 
     try:
         while _running and not rospy.is_shutdown():
@@ -623,22 +603,11 @@ def start():
             # In override mode, the keyboard fully controls motion.
             # We still keep looping for key polling and clean shutdown.
             if override_mode:
-                # Keep TOF logs flowing even in override mode for visibility.
-                now = time.time()
-                if now - last_tof_log_s >= TOF_LOG_INTERVAL_S:
-                    range_m, ts = get_tof_snapshot()
-                    log_tof_reading(range_m, ts, override_mode)
-                    last_tof_log_s = now
                 time.sleep(0.05)
                 continue
 
             range_m, ts = get_tof_snapshot()
             now = time.time()
-
-            # Periodic TOF telemetry logging in autonomous mode.
-            if now - last_tof_log_s >= TOF_LOG_INTERVAL_S:
-                log_tof_reading(range_m, ts, override_mode)
-                last_tof_log_s = now
 
             # If TOF is stale/missing, treat it as "no obstacle seen" and keep
             # moving forward (requested behavior for max-range/no-return cases).
@@ -656,7 +625,7 @@ def start():
                     moving_forward = False
                 time.sleep(SETTLE_S)
 
-                best_offset, best_dist, override_mode, interrupted = (
+                best_offset, _, override_mode, interrupted = (
                     choose_best_heading_with_scan(
                         recorder=recorder,
                         keyboard=keyboard,
@@ -667,10 +636,6 @@ def start():
                     moving_forward = False
                     time.sleep(0.05)
                     continue
-                print(
-                    "Blocked at %.3fm, best heading right=%d deg (%.3fm)"
-                    % (range_m, best_offset, best_dist)
-                )
                 override_mode, interrupted = turn_to_best_heading(
                     recorder=recorder,
                     keyboard=keyboard,
@@ -705,7 +670,7 @@ if __name__ == "__main__":
 
     rollereye.start()
     # `rollereye.start()` redirects stdout to /dev/null in this SDK.
-    # Re-enable stdout so debugging prints (including TOF logs) are visible.
+    # Re-enable stdout so control/status prints are visible.
     enable_print()
     try:
         start()
