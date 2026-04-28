@@ -41,8 +41,8 @@ FORWARD_SPEED_MPS = 0.16
 # Rotation speed used for scan turns (deg/s).
 TURN_SPEED_DPS = 90
 
-# Scan resolution. Increased to 60deg to make scan roughly 2x faster.
-SCAN_STEP_DEG = 60
+# Scan resolution. Smaller step = better heading search, slower scan.
+SCAN_STEP_DEG = 30
 
 # Do not pick headings in the rear half of the robot.
 # This keeps recovery turns from backtracking toward already-traveled space.
@@ -56,8 +56,7 @@ MAX_FORWARD_TURN_DEG = 90
 TOF_STALE_TIMEOUT_S = 1.0
 
 # Timeout to wait for one fresh TOF reading after each turn.
-# Halved to speed up scan responsiveness.
-TOF_WAIT_TIMEOUT_S = 0.25
+TOF_WAIT_TIMEOUT_S = 0.5
 
 # Tiny settle wait to let motion/reading stabilize between operations.
 SETTLE_S = 0.15
@@ -319,10 +318,11 @@ def rotate_deg(recorder, direction, degrees, record=True):
 
 def choose_best_heading_with_scan(recorder, keyboard, override_mode):
     """
-    Scan 360 degrees in SCAN_STEP_DEG increments and choose best heading.
+    Scan only the forward sector and choose the best heading.
 
-    We rotate right one step at a time, sample front TOF after each step,
-    then finish the full circle (ending back at the original heading).
+    We sample center (0 deg), then check right-side offsets up to
+    MAX_FORWARD_TURN_DEG, return to center, then check left-side offsets up to
+    MAX_FORWARD_TURN_DEG, and finally return to center heading.
 
     Returns:
       best_offset_right_deg: heading offset (from original), turning right.
@@ -330,7 +330,7 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
       override_mode: possibly-updated mode if user toggled during scan.
       interrupted: True when a user key command should abort autonomous scan.
     """
-    steps = int(360 / SCAN_STEP_DEG)
+    scan_offsets = list(range(SCAN_STEP_DEG, MAX_FORWARD_TURN_DEG + 1, SCAN_STEP_DEG))
 
     # Measure current heading first (offset = 0).
     best_distance, override_mode, interrupted = wait_for_fresh_tof(
@@ -345,10 +345,8 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
         best_distance = 0.0
     best_offset_right_deg = 0
 
-    # Rotate through all headings and track best clearance.
-    # Even though we measure all 360 degrees, we intentionally ignore rear
-    # hemisphere candidates so the robot does not choose a backtracking route.
-    for step_idx in range(1, steps):
+    # Scan to the right side (0 -> +MAX_FORWARD_TURN_DEG).
+    for offset in scan_offsets:
         key = keyboard.read_key()
         if key is not None:
             override_mode, _, should_interrupt = process_key_command(
@@ -373,13 +371,65 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
         if d is None:
             d = 0.0
 
-        offset = step_idx * SCAN_STEP_DEG
-        if is_offset_in_forward_sector(offset) and d > best_distance:
+        if d > best_distance:
             best_distance = d
             best_offset_right_deg = offset
 
-    # Final step to return to original heading (completes full 360 scan).
-    rotate_deg(recorder=recorder, direction=2, degrees=SCAN_STEP_DEG, record=False)
+    # Return from right-most offset back to center.
+    for _ in scan_offsets:
+        key = keyboard.read_key()
+        if key is not None:
+            override_mode, _, should_interrupt = process_key_command(
+                key=key, recorder=recorder, override_mode=override_mode
+            )
+            if should_interrupt:
+                return best_offset_right_deg, best_distance, override_mode, True
+        rotate_deg(
+            recorder=recorder, direction=1, degrees=SCAN_STEP_DEG, record=False
+        )
+
+    # Scan to the left side (0 -> -MAX_FORWARD_TURN_DEG).
+    for step_count, _ in enumerate(scan_offsets, start=1):
+        key = keyboard.read_key()
+        if key is not None:
+            override_mode, _, should_interrupt = process_key_command(
+                key=key, recorder=recorder, override_mode=override_mode
+            )
+            if should_interrupt:
+                return best_offset_right_deg, best_distance, override_mode, True
+        rotate_deg(
+            recorder=recorder, direction=1, degrees=SCAN_STEP_DEG, record=False
+        )
+        d, override_mode, interrupted = wait_for_fresh_tof(
+            TOF_WAIT_TIMEOUT_S,
+            keyboard=keyboard,
+            recorder=recorder,
+            override_mode=override_mode,
+        )
+        if interrupted:
+            return best_offset_right_deg, best_distance, override_mode, True
+        if d is None:
+            d = 0.0
+
+        # Convert left offsets into right-turn representation:
+        # left 30 => right 330, left 60 => right 300, etc.
+        offset_right = (360 - step_count * SCAN_STEP_DEG) % 360
+        if d > best_distance:
+            best_distance = d
+            best_offset_right_deg = offset_right
+
+    # Return from left-most offset back to center.
+    for _ in scan_offsets:
+        key = keyboard.read_key()
+        if key is not None:
+            override_mode, _, should_interrupt = process_key_command(
+                key=key, recorder=recorder, override_mode=override_mode
+            )
+            if should_interrupt:
+                return best_offset_right_deg, best_distance, override_mode, True
+        rotate_deg(
+            recorder=recorder, direction=2, degrees=SCAN_STEP_DEG, record=False
+        )
 
     return best_offset_right_deg, best_distance, override_mode, False
 
