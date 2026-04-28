@@ -423,7 +423,7 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
     delta_left = steps - delta_right
 
     if delta_right == 0:
-        # Already facing the best heading — no turn needed.
+        # Already facing the best heading - no turn needed.
         pass
     elif delta_right <= delta_left:
         # Fewer steps turning right.
@@ -719,7 +719,7 @@ def start():
                 # If every heading was blocked (e.g. dead end), backtrack along
                 # the recorded path instead of driving straight into a wall again.
                 if best_dist <= STOP_DISTANCE_M:
-                    print("[auto] all paths blocked — backtracking")
+                    print("[auto] all paths blocked - backtracking")
                     recorder.replay_reverse()
                     time.sleep(SETTLE_S)
 
