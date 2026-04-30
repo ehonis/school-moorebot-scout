@@ -46,8 +46,9 @@ TURN_SPEED_DPS = 90
 SCAN_STEP_DEG = 45
 
 # Continuous spin speed for scan-only turns (deg/s).
-# Kept higher than regular turn speed so blocked recovery decisions are quick.
-SCAN_TURN_SPEED_DPS = 120
+# Intentionally slower than before so TOF gets a cleaner read at each heading
+# and the robot visibly completes a deliberate full sweep before deciding.
+SCAN_TURN_SPEED_DPS = 60
 
 # Do not pick headings in the rear half of the robot.
 # This keeps recovery turns from backtracking toward already-traveled space.
@@ -347,14 +348,17 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
       The returned offset is always 0 because the robot is already pointed at
       the best heading, so turn_to_best_heading() becomes a no-op.
     """
-    # Total number of angular samples (e.g. 360 / 45 = 8).
+    # Total number of angular heading buckets (e.g. 360 / 45 = 8).
     steps = int(360 / SCAN_STEP_DEG)
     # Time between samples while continuously spinning.
     sample_period_s = float(SCAN_STEP_DEG) / float(SCAN_TURN_SPEED_DPS)
 
-    # distances[i] = clearance measured at (i * SCAN_STEP_DEG) degrees right
-    # of the heading where this scan started.
-    distances = []
+    # We intentionally capture one extra sample:
+    #   - sample 0   at start heading (0 deg)
+    #   - sample N   after a full 360 deg sweep
+    # The final sample confirms the robot truly completed a full circle.
+    target_samples = steps + 1
+    raw_distances = []
 
     # Start an in-place continuous right spin for sensing.
     # We call SDK primitives directly (not recorder) so this scan motion is
@@ -366,7 +370,7 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
     next_sample_time_s = time.time()
     interrupted = False
     try:
-        while len(distances) < steps:
+        while len(raw_distances) < target_samples:
             # Allow immediate user intervention even mid-spin.
             key = keyboard.read_key()
             if key is not None:
@@ -386,7 +390,7 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
                     d = range_m
                 else:
                     d = 0.0
-                distances.append(d)
+                raw_distances.append(d)
                 next_sample_time_s += sample_period_s
 
             time.sleep(0.01)
@@ -396,10 +400,19 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
         time.sleep(SETTLE_S)
 
     if interrupted:
-        return 0, max(distances) if distances else 0.0, override_mode, True
+        return (
+            0,
+            max(raw_distances) if raw_distances else 0.0,
+            override_mode,
+            True,
+        )
 
-    # After the loop the robot has rotated approximately
-    # (steps - 1) * SCAN_STEP_DEG degrees to the right.
+    # Fold samples into one value per heading bucket.
+    # The (steps)-th sample is the same physical heading as sample 0 because
+    # the robot just completed a full turn, so we keep the better clearance.
+    distances = raw_distances[:steps]
+    if len(raw_distances) > steps:
+        distances[0] = max(distances[0], raw_distances[steps])
 
     # --- Find the best heading (two-pass: forward sector preferred). ---
     best_step = None
@@ -420,10 +433,11 @@ def choose_best_heading_with_scan(recorder, keyboard, override_mode):
     )
 
     # --- Turn from the current position directly to the best heading. ---
-    # Current position is at step index (steps - 1) from the original.
+    # Current position is effectively back to step 0 from the original heading
+    # because this scan captures a complete 360-degree sweep.
     # We need to get to step index best_step. The shortest arc might be
     # a small right turn or a small left turn.
-    current_step = steps - 1
+    current_step = 0
     # How many SCAN_STEP_DEG right-turns to reach best_step from current_step.
     delta_right = (best_step - current_step) % steps
     # Equivalent left-turn count.
